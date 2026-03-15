@@ -4,15 +4,64 @@ import hashlib
 import io
 import json
 import re
+import sqlite3
 import urllib.error
 import urllib.request
 import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
-from flask import Flask, render_template_string, request, send_file
+from flask import Flask, jsonify, render_template_string, request, send_file
 from PIL import Image
 
 app = Flask(__name__)
+DB_PATH = Path(__file__).with_name("tracker.db")
+
+
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_mappings (
+                email TEXT PRIMARY KEY,
+                identifier TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_generated_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+def upsert_email_mappings(emails: List[str]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [(email, email_to_10_digits(email), now, now) for email in emails]
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executemany(
+            """
+            INSERT INTO email_mappings (email, identifier, created_at, last_generated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                identifier=excluded.identifier,
+                last_generated_at=excluded.last_generated_at
+            """,
+            rows,
+        )
+
+
+def get_all_email_mappings() -> List[Dict[str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT email, identifier, created_at, last_generated_at
+            FROM email_mappings
+            ORDER BY last_generated_at DESC
+            """
+        ).fetchall()
+
+    return [dict(row) for row in rows]
 
 
 def email_to_10_digits(email: str) -> str:
@@ -80,7 +129,7 @@ def fetch_records_from_jsonl(url: str) -> Tuple[List[Dict[str, object]], str | N
     target_url = normalize_jsonl_url(url)
 
     try:
-        req = urllib.request.Request(target_url, headers={"User-Agent": "TrackDashboard/1.0"})
+        req = urllib.request.Request(target_url, headers={"User-Agent": "TrackDashboard/2.0"})
         with urllib.request.urlopen(req, timeout=10) as response:
             payload = response.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
@@ -102,49 +151,77 @@ def fetch_records_from_jsonl(url: str) -> Tuple[List[Dict[str, object]], str | N
         if candidate:
             record["identifier"] = candidate
             record["source_url"] = target_url
+            record["event_key"] = (
+                f"{target_url}|{record.get('timestamp', '')}|{record.get('image', '')}|{record.get('ip', '')}"
+            )
             records.append(record)
 
     return records, None
 
 
-def analyze_stay_data(raw_emails: str, raw_urls: str) -> Dict[str, object]:
-    emails = parse_emails(raw_emails)
+def analyze_stay_data(raw_urls: str, known_event_keys: Set[str] | None = None) -> Dict[str, object]:
     urls = parse_urls(raw_urls)
+    mapping_rows = get_all_email_mappings()
+    email_map = {row["identifier"]: row["email"] for row in mapping_rows}
 
-    email_map = {email_to_10_digits(email): email for email in emails}
+    known_event_keys = known_event_keys or set()
     all_found_ids: Set[str] = set()
+    all_rows: List[Dict[str, object]] = []
     matched_rows: List[Dict[str, object]] = []
+    new_matched_rows: List[Dict[str, object]] = []
     url_errors: List[str] = []
 
     for url in urls:
         records, error = fetch_records_from_jsonl(url)
-        found_ids = {str(record.get("identifier", "")) for record in records if record.get("identifier")}
-        all_found_ids.update(found_ids)
 
         for record in records:
             identifier = str(record.get("identifier", ""))
+            if not identifier:
+                continue
+            all_found_ids.add(identifier)
+
+            enriched = {
+                "email": email_map.get(identifier, ""),
+                **record,
+            }
+            all_rows.append(enriched)
+
             if identifier in email_map:
-                row = {"email": email_map[identifier], **record}
-                matched_rows.append(row)
+                matched_rows.append(enriched)
+                if str(record.get("event_key", "")) not in known_event_keys:
+                    new_matched_rows.append(enriched)
 
         if error:
             url_errors.append(error)
 
+    def ts_sort_key(item: Dict[str, object]) -> int:
+        value = item.get("timestamp")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return 0
+
+    matched_rows.sort(key=ts_sort_key, reverse=True)
+    new_matched_rows.sort(key=ts_sort_key, reverse=True)
+    all_rows.sort(key=ts_sort_key, reverse=True)
+
     unmatched_ids = sorted(identifier for identifier in all_found_ids if identifier not in email_map)
 
-    mapped_ids = sorted(email_map.keys())
-
     return {
-        "emails": emails,
-        "mapped_ids": mapped_ids,
         "urls": urls,
         "matches": matched_rows,
+        "new_matches": new_matched_rows,
+        "all_rows": all_rows[:120],
         "matched_count": len(matched_rows),
+        "new_matched_count": len(new_matched_rows),
         "found_count": len(all_found_ids),
-        "email_count": len(emails),
+        "stored_email_count": len(mapping_rows),
         "url_count": len(urls),
         "unmatched_ids": unmatched_ids,
         "errors": url_errors,
+        "stored_mappings": mapping_rows[:120],
+        "run_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
 
 
@@ -288,30 +365,35 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Email Image Packager</title>
+    <title>Email Tracker Workbench</title>
     <style>
         * { box-sizing: border-box; }
         body {
             margin: 0;
-            font-family: Arial, Helvetica, sans-serif;
-            background: #0d1117;
-            color: #e6edf3;
+            font-family: Inter, Arial, sans-serif;
+            background: radial-gradient(circle at top right, #1b2a4a, #0c111b 45%);
+            color: #edf2f8;
         }
-        .layout {
-            min-height: 100vh;
-            display: flex;
-        }
+        .layout { min-height: 100vh; display: flex; }
         .sidebar {
-            width: 240px;
-            background: #010409;
-            border-right: 1px solid #21262d;
+            width: 260px;
+            background: rgba(8,12,19,0.95);
+            border-right: 1px solid #273247;
             padding: 24px 16px;
+            position: sticky;
+            top: 0;
+            height: 100vh;
         }
         .brand {
             font-size: 20px;
-            font-weight: 700;
-            margin-bottom: 28px;
-            color: #58a6ff;
+            font-weight: 800;
+            color: #61dafb;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            color: #9cb0cc;
+            font-size: 12px;
+            margin-bottom: 22px;
         }
         .nav-item {
             display: block;
@@ -319,241 +401,260 @@ HTML_TEMPLATE = """
             padding: 12px 14px;
             margin-bottom: 10px;
             border-radius: 12px;
-            background: #0d1117;
-            border: 1px solid #21262d;
-            color: #c9d1d9;
+            background: #121b2a;
+            border: 1px solid #2d3d5d;
+            color: #d7e4fb;
+            font-weight: 600;
         }
-        .nav-item.active {
-            background: #161b22;
-            border-color: #30363d;
-        }
-        .content {
-            flex: 1;
-            padding: 32px;
-        }
+        .nav-item.active { background: #203050; border-color: #4f78d0; }
+        .content { flex: 1; padding: 28px; }
         .card {
-            max-width: 980px;
-            background: #161b22;
-            border: 1px solid #30363d;
+            max-width: 1180px;
+            background: rgba(14,20,32,0.95);
+            border: 1px solid #2d3d5d;
             border-radius: 18px;
             padding: 24px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+            box-shadow: 0 16px 40px rgba(0,0,0,0.35);
+            margin-bottom: 18px;
         }
-        h1 {
-            margin-top: 0;
-            margin-bottom: 10px;
-            font-size: 28px;
-        }
-        p {
-            color: #8b949e;
-            line-height: 1.6;
-        }
+        h1 { margin: 0 0 8px; font-size: 30px; }
+        p { color: #acc0df; line-height: 1.6; }
         textarea {
-            width: 100%;
-            min-height: 220px;
-            resize: vertical;
-            border-radius: 14px;
-            border: 1px solid #30363d;
-            background: #0d1117;
-            color: #e6edf3;
-            padding: 16px;
-            font-size: 14px;
-            outline: none;
+            width: 100%; min-height: 180px; resize: vertical; border-radius: 14px;
+            border: 1px solid #41557a; background: #0b1220; color: #edf2f8;
+            padding: 14px; font-size: 14px; outline: none;
         }
-        textarea:focus {
-            border-color: #58a6ff;
-            box-shadow: 0 0 0 3px rgba(88,166,255,0.15);
-        }
-        .row {
-            display: flex;
-            gap: 16px;
-            margin-top: 16px;
-            flex-wrap: wrap;
-        }
+        textarea:focus { border-color: #61dafb; box-shadow: 0 0 0 3px rgba(97,218,251,0.2); }
+        .row { display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap; align-items: center; }
         .btn {
-            border: 0;
-            border-radius: 12px;
-            padding: 14px 20px;
-            font-size: 14px;
-            font-weight: 700;
-            cursor: pointer;
+            border: 0; border-radius: 12px; padding: 12px 18px; font-size: 14px;
+            font-weight: 700; cursor: pointer;
         }
-        .btn-primary {
-            background: #238636;
-            color: white;
+        .btn-primary { background: linear-gradient(90deg, #2775ff, #32c5ff); color: white; }
+        .btn-muted { background: #1f2a3f; color: #d7e4fb; border: 1px solid #40557d; }
+        .pill {
+            border: 1px solid #335a78; background: #112033; color: #9fd6f5;
+            border-radius: 999px; padding: 6px 10px; font-size: 12px;
         }
-        .btn-primary:hover {
-            background: #2ea043;
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 12px;
+            margin-top: 16px;
         }
         .stat {
-            background: #0d1117;
-            border: 1px solid #30363d;
+            background: #0c1526;
+            border: 1px solid #2f4468;
             border-radius: 14px;
-            padding: 14px 16px;
-            min-width: 170px;
+            padding: 12px;
         }
-        .stat-label {
-            color: #8b949e;
-            font-size: 12px;
-            margin-bottom: 6px;
-        }
-        .stat-value {
-            font-size: 20px;
-            font-weight: 700;
-        }
+        .stat-label { color: #95accf; font-size: 12px; margin-bottom: 4px; }
+        .stat-value { font-size: 22px; font-weight: 800; }
         .error {
-            margin-top: 16px;
-            background: rgba(248,81,73,0.12);
-            color: #ffb4ac;
-            border: 1px solid rgba(248,81,73,0.35);
-            padding: 12px 14px;
-            border-radius: 12px;
+            margin-top: 16px; background: rgba(248,81,73,0.13); color: #ffcbc6;
+            border: 1px solid rgba(248,81,73,0.35); padding: 12px 14px; border-radius: 12px;
         }
-        .table {
-            width: 100%;
-            margin-top: 16px;
-            border-collapse: collapse;
-        }
-        .table th,
-        .table td {
-            text-align: left;
-            border-bottom: 1px solid #30363d;
-            padding: 10px 8px;
-            font-size: 14px;
-        }
-        .muted {
-            color: #8b949e;
-            font-size: 13px;
-        }
+        .table-wrap { overflow-x: auto; border: 1px solid #2f4468; border-radius: 12px; margin-top: 14px; }
+        .table { width: 100%; border-collapse: collapse; min-width: 840px; }
+        .table th, .table td { text-align: left; border-bottom: 1px solid #263855; padding: 9px 8px; font-size: 13px; }
+        .table th { color: #a8c3eb; background: #101d33; position: sticky; top: 0; }
+        .muted { color: #97adcb; font-size: 13px; }
+        .step-item { border-left: 3px solid #4fa4ff; padding: 8px 12px; margin-top: 8px; background: #101b2e; border-radius: 8px; }
+        code { background: #0e1a2e; border: 1px solid #2f4468; padding: 2px 6px; border-radius: 7px; }
     </style>
 </head>
 <body>
     <div class="layout">
         <aside class="sidebar">
-            <div class="brand">Black Dashboard</div>
-            <a href="/" class="nav-item {{ 'active' if active_page == 'packager' else '' }}">Email to PNG Package</a>
-            <a href="/stay" class="nav-item {{ 'active' if active_page == 'stay' else '' }}">Stay</a>
+            <div class="brand">Tracker Workbench</div>
+            <div class="subtitle">Generate, store, and monitor image tracking logs</div>
+            <a href="/" class="nav-item {{ 'active' if active_page == 'packager' else '' }}">Email → PNG Package</a>
+            <a href="/stay" class="nav-item {{ 'active' if active_page == 'stay' else '' }}">Stay Monitor</a>
         </aside>
 
         <main class="content">
             {% if active_page == 'packager' %}
             <div class="card">
                 <h1>Email to PNG Package</h1>
-                <p>Paste one email per line, or comma-separated. The app generates a ZIP containing <code>track.php</code>, <code>.htaccess</code>, and an <code>image/</code> folder with blank white PNG files named by the numeric email identifier.</p>
+                <p>Enter one email per line (or comma-separated). When you generate the ZIP, every email is automatically saved in the local database with its 10-digit identifier so the Stay Monitor can analyze logs using URLs only.</p>
 
                 <form method="post" action="/generate">
                     <textarea name="emails" placeholder="john@example.com\nalice@example.com">{{ emails|default('') }}</textarea>
                     <div class="row">
-                        <button type="submit" class="btn btn-primary">Generate ZIP</button>
+                        <button type="submit" class="btn btn-primary">Generate ZIP + Save to DB</button>
+                        <span class="pill">Database entries: {{ db_total }}</span>
                     </div>
                 </form>
 
-                <div class="row">
-                    <div class="stat">
-                        <div class="stat-label">Valid Emails</div>
-                        <div class="stat-value">{{ valid_count }}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-label">Unique Emails</div>
-                        <div class="stat-value">{{ unique_count }}</div>
-                    </div>
+                <div class="stats-grid">
+                    <div class="stat"><div class="stat-label">Valid Emails</div><div class="stat-value">{{ valid_count }}</div></div>
+                    <div class="stat"><div class="stat-label">Unique Emails</div><div class="stat-value">{{ unique_count }}</div></div>
+                    <div class="stat"><div class="stat-label">Stored IDs (DB)</div><div class="stat-value">{{ db_total }}</div></div>
                 </div>
 
-                {% if error %}
-                    <div class="error">{{ error }}</div>
-                {% endif %}
+                {% if error %}<div class="error">{{ error }}</div>{% endif %}
             </div>
             {% else %}
             <div class="card">
-                <h1>Stay Dashboard</h1>
-                <p>ضع الإيميلات في الحقل الأول، وروابط JSONL في الحقل الثاني (رابط بكل سطر). سيتم تحويل الإيميلات إلى معرف 10 أرقام ثم مقارنة أي ملف <code>.png</code> يظهر في اللوجات مع هذه المعرفات.</p>
+                <h1>Stay Monitor Dashboard</h1>
+                <p>Paste only JSONL URLs. The monitor uses saved email identifiers from the local database, analyzes logs immediately, and auto-polls every 30 seconds to surface new matches.</p>
 
-                <form method="post" action="/stay">
-                    <label class="muted">Emails</label>
-                    <textarea name="emails" placeholder="john@example.com\nalice@example.com">{{ stay_emails|default('') }}</textarea>
-
-                    <label class="muted" style="display:block; margin-top:14px;">URLs (JSONL)</label>
-                    <textarea name="urls" placeholder="https://site.com/image_log.jsonl">{{ stay_urls|default('') }}</textarea>
-
+                <form id="stay-form" method="post" action="/stay">
+                    <label class="muted">URLs (one URL per line)</label>
+                    <textarea id="urls" name="urls" placeholder="https://example.com/image_log.jsonl">{{ stay_urls|default('') }}</textarea>
                     <div class="row">
                         <button type="submit" class="btn btn-primary">Analyze Stay Logs</button>
+                        <button id="toggle-monitor" type="button" class="btn btn-muted">Pause Auto Monitor</button>
+                        <span class="pill">Poll interval: 30s</span>
                     </div>
                 </form>
 
-                <div class="row">
-                    <div class="stat">
-                        <div class="stat-label">Emails</div>
-                        <div class="stat-value">{{ stay_email_count }}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-label">URLs</div>
-                        <div class="stat-value">{{ stay_url_count }}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-label">Found IDs</div>
-                        <div class="stat-value">{{ stay_found_count }}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-label">Matched</div>
-                        <div class="stat-value">{{ stay_matched_count }}</div>
-                    </div>
+                <div class="stats-grid" id="stats-grid">
+                    <div class="stat"><div class="stat-label">Stored Emails</div><div class="stat-value" id="stored-count">{{ stay_email_count }}</div></div>
+                    <div class="stat"><div class="stat-label">URLs</div><div class="stat-value" id="url-count">{{ stay_url_count }}</div></div>
+                    <div class="stat"><div class="stat-label">Found IDs</div><div class="stat-value" id="found-count">{{ stay_found_count }}</div></div>
+                    <div class="stat"><div class="stat-label">Total Matched</div><div class="stat-value" id="matched-count">{{ stay_matched_count }}</div></div>
+                    <div class="stat"><div class="stat-label">New Matches (last run)</div><div class="stat-value" id="new-count">0</div></div>
                 </div>
 
-                {% if stay_errors %}
-                    <div class="error">
-                        {% for err in stay_errors %}
-                            <div>{{ err }}</div>
-                        {% endfor %}
-                    </div>
-                {% endif %}
+                <div class="row muted" style="margin-top:14px;">
+                    <span>Last run: <strong id="last-run">{{ stay_run_at or '-' }}</strong></span>
+                    <span>Monitor status: <strong id="monitor-status">Active</strong></span>
+                </div>
 
-                {% if stay_matches %}
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>Identifier</th>
-                            <th>Email</th>
-                            <th>Time ISO</th>
-                            <th>Timestamp</th>
-                            <th>Image</th>
-                            <th>IP</th>
-                            <th>User Agent</th>
-                            <th>Referer</th>
-                            <th>Method</th>
-                            <th>Request URI</th>
-                            <th>Source URL</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <div id="error-box" class="error" style="display:none;"></div>
+
+                <h3>Monitor Steps</h3>
+                <div id="steps-log">
+                    <div class="step-item">1) URLs accepted and normalized.</div>
+                    <div class="step-item">2) image_log.jsonl records fetched from all URLs.</div>
+                    <div class="step-item">3) Extracted 10-digit identifiers from image/request_uri fields.</div>
+                    <div class="step-item">4) Compared identifiers with local DB mappings.</div>
+                    <div class="step-item">5) Displayed complete and newly discovered matches.</div>
+                </div>
+
+                <h3 style="margin-top:20px;">Matched Events</h3>
+                <div class="table-wrap">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Identifier</th><th>Email</th><th>Time ISO</th><th>Timestamp</th><th>Image</th><th>IP</th>
+                                <th>User Agent</th><th>Referer</th><th>Method</th><th>Request URI</th><th>Source URL</th>
+                            </tr>
+                        </thead>
+                        <tbody id="match-body">
                         {% for item in stay_matches %}
                         <tr>
-                            <td>{{ item.identifier }}</td>
-                            <td>{{ item.email }}</td>
-                            <td>{{ item.time_iso }}</td>
-                            <td>{{ item.timestamp }}</td>
-                            <td>{{ item.image }}</td>
-                            <td>{{ item.ip }}</td>
-                            <td>{{ item.user_agent }}</td>
-                            <td>{{ item.referer }}</td>
-                            <td>{{ item.method }}</td>
-                            <td>{{ item.request_uri }}</td>
-                            <td>{{ item.source_url }}</td>
+                            <td>{{ item.identifier }}</td><td>{{ item.email }}</td><td>{{ item.time_iso }}</td><td>{{ item.timestamp }}</td>
+                            <td>{{ item.image }}</td><td>{{ item.ip }}</td><td>{{ item.user_agent }}</td><td>{{ item.referer }}</td>
+                            <td>{{ item.method }}</td><td>{{ item.request_uri }}</td><td>{{ item.source_url }}</td>
                         </tr>
                         {% endfor %}
-                    </tbody>
-                </table>
-                {% elif stay_checked %}
-                    <p class="muted">No matching identifiers were found.</p>
-                {% endif %}
+                        </tbody>
+                    </table>
+                </div>
 
-                {% if stay_mapped_ids %}
-                    <p class="muted">Email IDs (10 digits): {{ stay_mapped_ids|join(', ') }}</p>
-                {% endif %}
+                <p class="muted" id="unmatched">{% if stay_unmatched_ids %}Unmatched IDs: {{ stay_unmatched_ids|join(', ') }}{% endif %}</p>
 
-                {% if stay_unmatched_ids %}
-                    <p class="muted">Unmatched IDs in logs: {{ stay_unmatched_ids|join(', ') }}</p>
-                {% endif %}
+                <h3>Stored Mapping Snapshot</h3>
+                <div class="table-wrap">
+                    <table class="table">
+                        <thead><tr><th>Email</th><th>Identifier</th><th>Created At</th><th>Last Generated</th></tr></thead>
+                        <tbody id="mapping-body">
+                        {% for row in stay_mappings %}
+                        <tr><td>{{ row.email }}</td><td>{{ row.identifier }}</td><td>{{ row.created_at }}</td><td>{{ row.last_generated_at }}</td></tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
+
+            <script>
+                const knownEventKeys = new Set();
+                let monitorActive = true;
+
+                function escapeHtml(value) {
+                    return String(value ?? '').replace(/[&<>"']/g, function(ch) {
+                        return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
+                    });
+                }
+
+                function rowHtml(item) {
+                    return `<tr>
+                        <td>${escapeHtml(item.identifier)}</td><td>${escapeHtml(item.email)}</td><td>${escapeHtml(item.time_iso)}</td>
+                        <td>${escapeHtml(item.timestamp)}</td><td>${escapeHtml(item.image)}</td><td>${escapeHtml(item.ip)}</td>
+                        <td>${escapeHtml(item.user_agent)}</td><td>${escapeHtml(item.referer)}</td><td>${escapeHtml(item.method)}</td>
+                        <td>${escapeHtml(item.request_uri)}</td><td>${escapeHtml(item.source_url)}</td>
+                    </tr>`;
+                }
+
+                function renderAnalysis(data) {
+                    document.getElementById('stored-count').textContent = data.stored_email_count;
+                    document.getElementById('url-count').textContent = data.url_count;
+                    document.getElementById('found-count').textContent = data.found_count;
+                    document.getElementById('matched-count').textContent = data.matched_count;
+                    document.getElementById('new-count').textContent = data.new_matched_count;
+                    document.getElementById('last-run').textContent = data.run_at;
+                    document.getElementById('unmatched').textContent = data.unmatched_ids.length
+                        ? `Unmatched IDs: ${data.unmatched_ids.join(', ')}`
+                        : 'All discovered IDs are mapped in the database.';
+
+                    const body = document.getElementById('match-body');
+                    body.innerHTML = data.matches.length ? data.matches.map(rowHtml).join('') : '<tr><td colspan="11">No matched events yet.</td></tr>';
+
+                    const mappingBody = document.getElementById('mapping-body');
+                    mappingBody.innerHTML = data.stored_mappings.length
+                        ? data.stored_mappings.map(item => `<tr><td>${escapeHtml(item.email)}</td><td>${escapeHtml(item.identifier)}</td><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(item.last_generated_at)}</td></tr>`).join('')
+                        : '<tr><td colspan="4">No saved mappings yet. Generate a package first.</td></tr>';
+
+                    data.matches.forEach(item => {
+                        if (item.event_key) {
+                            knownEventKeys.add(item.event_key);
+                        }
+                    });
+
+                    const errBox = document.getElementById('error-box');
+                    if (data.errors.length) {
+                        errBox.style.display = 'block';
+                        errBox.innerHTML = data.errors.map(e => `<div>${escapeHtml(e)}</div>`).join('');
+                    } else {
+                        errBox.style.display = 'none';
+                        errBox.innerHTML = '';
+                    }
+                }
+
+                async function analyze() {
+                    const urls = document.getElementById('urls').value;
+                    const response = await fetch('/stay/analyze', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ urls, known_event_keys: Array.from(knownEventKeys) })
+                    });
+                    if (!response.ok) {
+                        throw new Error('Analyze request failed');
+                    }
+                    const data = await response.json();
+                    renderAnalysis(data);
+                }
+
+                document.getElementById('stay-form').addEventListener('submit', async function(event) {
+                    event.preventDefault();
+                    knownEventKeys.clear();
+                    await analyze();
+                });
+
+                document.getElementById('toggle-monitor').addEventListener('click', function() {
+                    monitorActive = !monitorActive;
+                    document.getElementById('monitor-status').textContent = monitorActive ? 'Active' : 'Paused';
+                    this.textContent = monitorActive ? 'Pause Auto Monitor' : 'Resume Auto Monitor';
+                });
+
+                setInterval(async () => {
+                    if (!monitorActive) return;
+                    if (!document.getElementById('urls').value.trim()) return;
+                    try { await analyze(); } catch (err) { console.error(err); }
+                }, 30000);
+            </script>
             {% endif %}
         </main>
     </div>
@@ -564,12 +665,14 @@ HTML_TEMPLATE = """
 
 @app.route("/", methods=["GET"])
 def index():
+    db_total = len(get_all_email_mappings())
     return render_template_string(
         HTML_TEMPLATE,
         active_page="packager",
         emails="",
         valid_count=0,
         unique_count=0,
+        db_total=db_total,
         error="",
     )
 
@@ -586,9 +689,11 @@ def generate():
             emails=raw_emails,
             valid_count=0,
             unique_count=0,
+            db_total=len(get_all_email_mappings()),
             error="No valid emails were found.",
         )
 
+    upsert_email_mappings(emails)
     zip_buffer = build_zip(emails)
     return send_file(
         zip_buffer,
@@ -604,39 +709,49 @@ def stay_dashboard():
         return render_template_string(
             HTML_TEMPLATE,
             active_page="stay",
-            stay_emails="",
             stay_urls="",
-            stay_email_count=0,
+            stay_email_count=len(get_all_email_mappings()),
             stay_url_count=0,
             stay_found_count=0,
             stay_matched_count=0,
-            stay_mapped_ids=[],
             stay_matches=[],
             stay_unmatched_ids=[],
             stay_errors=[],
-            stay_checked=False,
+            stay_mappings=get_all_email_mappings()[:120],
+            stay_run_at="-",
         )
 
-    raw_emails = request.form.get("emails", "")
     raw_urls = request.form.get("urls", "")
-    analysis = analyze_stay_data(raw_emails, raw_urls)
+    analysis = analyze_stay_data(raw_urls)
 
     return render_template_string(
         HTML_TEMPLATE,
         active_page="stay",
-        stay_emails=raw_emails,
         stay_urls=raw_urls,
-        stay_email_count=analysis["email_count"],
+        stay_email_count=analysis["stored_email_count"],
         stay_url_count=analysis["url_count"],
         stay_found_count=analysis["found_count"],
         stay_matched_count=analysis["matched_count"],
-        stay_mapped_ids=analysis["mapped_ids"],
         stay_matches=analysis["matches"],
         stay_unmatched_ids=analysis["unmatched_ids"],
         stay_errors=analysis["errors"],
-        stay_checked=True,
+        stay_mappings=analysis["stored_mappings"],
+        stay_run_at=analysis["run_at"],
     )
 
 
+@app.route("/stay/analyze", methods=["POST"])
+def stay_analyze_api():
+    payload = request.get_json(silent=True) or {}
+    raw_urls = str(payload.get("urls", ""))
+    known_event_keys = {str(item) for item in payload.get("known_event_keys", []) if str(item).strip()}
+    analysis = analyze_stay_data(raw_urls, known_event_keys=known_event_keys)
+    return jsonify(analysis)
+
+
 if __name__ == "__main__":
+    init_db()
     app.run(host="0.0.0.0", port=5004, debug=True)
+
+
+init_db()
