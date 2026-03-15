@@ -321,6 +321,11 @@ def build_htaccess() -> str:
     return """Options -Indexes
 DirectoryIndex disabled
 
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^image/([A-Za-z0-9._-]+\.png)$ track.php?img=$1 [L,QSA,NC]
+</IfModule>
+
 <IfModule mod_authz_core.c>
     <FilesMatch "^(track\\.php|image_log\\.jsonl)$">
         Require all granted
@@ -356,13 +361,28 @@ def build_zip(emails: List[str]) -> io.BytesIO:
     memory_file = io.BytesIO()
     blank_png = make_blank_png_bytes()
 
+    def write_with_mode(
+        zf: zipfile.ZipFile,
+        filename: str,
+        data: bytes | str,
+        mode: int,
+        is_dir: bool = False,
+    ) -> None:
+        info = zipfile.ZipInfo(filename)
+        info.date_time = datetime.now().timetuple()[:6]
+        info.create_system = 3  # Unix
+        file_type = 0o040000 if is_dir else 0o100000
+        info.external_attr = ((file_type | mode) & 0xFFFF) << 16
+        zf.writestr(info, data)
+
     with zipfile.ZipFile(memory_file, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("track.php", build_php_file())
-        zf.writestr(".htaccess", build_htaccess())
+        write_with_mode(zf, "track.php", build_php_file(), 0o644)
+        write_with_mode(zf, ".htaccess", build_htaccess(), 0o644)
+        write_with_mode(zf, "image/", b"", 0o755, is_dir=True)
 
         for email in emails:
             identifier = email_to_10_digits(email)
-            zf.writestr(f"image/{identifier}.png", blank_png)
+            write_with_mode(zf, f"image/{identifier}.png", blank_png, 0o644)
 
     memory_file.seek(0)
     return memory_file
