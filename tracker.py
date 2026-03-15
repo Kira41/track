@@ -322,13 +322,22 @@ def build_htaccess() -> str:
 DirectoryIndex disabled
 
 <IfModule mod_authz_core.c>
-    <FilesMatch "^(up\\.php)$">
+    <FilesMatch "^(track\\.php|image_log\\.jsonl)$">
+        Require all granted
+    </FilesMatch>
+
+    <FilesMatch "\\.png$">
         Require all granted
     </FilesMatch>
 </IfModule>
 
 <IfModule !mod_authz_core.c>
-    <FilesMatch "^(up\\.php)$">
+    <FilesMatch "^(track\\.php|image_log\\.jsonl)$">
+        Order Allow,Deny
+        Allow from all
+    </FilesMatch>
+
+    <FilesMatch "\\.png$">
         Order Allow,Deny
         Allow from all
     </FilesMatch>
