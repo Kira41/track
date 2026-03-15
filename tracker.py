@@ -7,7 +7,7 @@ import re
 import urllib.error
 import urllib.request
 import zipfile
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 from flask import Flask, render_template_string, request, send_file
 from PIL import Image
@@ -68,15 +68,23 @@ def extract_identifier_from_text(value: str) -> str | None:
     return None
 
 
-def fetch_identifiers_from_jsonl(url: str) -> tuple[Set[str], str | None]:
-    identifiers: Set[str] = set()
+def normalize_jsonl_url(url: str) -> str:
+    cleaned = url.strip()
+    if cleaned.endswith("/image_log.jsonl"):
+        return cleaned
+    return cleaned.rstrip("/") + "/image_log.jsonl"
+
+
+def fetch_records_from_jsonl(url: str) -> Tuple[List[Dict[str, object]], str | None]:
+    records: List[Dict[str, object]] = []
+    target_url = normalize_jsonl_url(url)
 
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "TrackDashboard/1.0"})
+        req = urllib.request.Request(target_url, headers={"User-Agent": "TrackDashboard/1.0"})
         with urllib.request.urlopen(req, timeout=10) as response:
             payload = response.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
-        return identifiers, f"{url}: {exc}"
+        return records, f"{target_url}: {exc}"
 
     for line in payload.splitlines():
         stripped = line.strip()
@@ -92,9 +100,11 @@ def fetch_identifiers_from_jsonl(url: str) -> tuple[Set[str], str | None]:
 
         candidate = extract_identifier_from_text(image_value) or extract_identifier_from_text(request_uri)
         if candidate:
-            identifiers.add(candidate)
+            record["identifier"] = candidate
+            record["source_url"] = target_url
+            records.append(record)
 
-    return identifiers, None
+    return records, None
 
 
 def analyze_stay_data(raw_emails: str, raw_urls: str) -> Dict[str, object]:
@@ -103,21 +113,24 @@ def analyze_stay_data(raw_emails: str, raw_urls: str) -> Dict[str, object]:
 
     email_map = {email_to_10_digits(email): email for email in emails}
     all_found_ids: Set[str] = set()
+    matched_rows: List[Dict[str, object]] = []
     url_errors: List[str] = []
 
     for url in urls:
-        found_ids, error = fetch_identifiers_from_jsonl(url)
+        records, error = fetch_records_from_jsonl(url)
+        found_ids = {str(record.get("identifier", "")) for record in records if record.get("identifier")}
         all_found_ids.update(found_ids)
+
+        for record in records:
+            identifier = str(record.get("identifier", ""))
+            if identifier in email_map:
+                row = {"email": email_map[identifier], **record}
+                matched_rows.append(row)
+
         if error:
             url_errors.append(error)
 
-    matched_ids = sorted(identifier for identifier in all_found_ids if identifier in email_map)
     unmatched_ids = sorted(identifier for identifier in all_found_ids if identifier not in email_map)
-
-    matches = [
-        {"identifier": identifier, "email": email_map[identifier]}
-        for identifier in matched_ids
-    ]
 
     mapped_ids = sorted(email_map.keys())
 
@@ -125,8 +138,8 @@ def analyze_stay_data(raw_emails: str, raw_urls: str) -> Dict[str, object]:
         "emails": emails,
         "mapped_ids": mapped_ids,
         "urls": urls,
-        "matches": matches,
-        "matched_count": len(matches),
+        "matches": matched_rows,
+        "matched_count": len(matched_rows),
         "found_count": len(all_found_ids),
         "email_count": len(emails),
         "url_count": len(urls),
@@ -500,13 +513,31 @@ HTML_TEMPLATE = """
                         <tr>
                             <th>Identifier</th>
                             <th>Email</th>
+                            <th>Time ISO</th>
+                            <th>Timestamp</th>
+                            <th>Image</th>
+                            <th>IP</th>
+                            <th>User Agent</th>
+                            <th>Referer</th>
+                            <th>Method</th>
+                            <th>Request URI</th>
+                            <th>Source URL</th>
                         </tr>
                     </thead>
                     <tbody>
                         {% for item in stay_matches %}
                         <tr>
-                            <td>{{ item.identifier }}.png</td>
+                            <td>{{ item.identifier }}</td>
                             <td>{{ item.email }}</td>
+                            <td>{{ item.time_iso }}</td>
+                            <td>{{ item.timestamp }}</td>
+                            <td>{{ item.image }}</td>
+                            <td>{{ item.ip }}</td>
+                            <td>{{ item.user_agent }}</td>
+                            <td>{{ item.referer }}</td>
+                            <td>{{ item.method }}</td>
+                            <td>{{ item.request_uri }}</td>
+                            <td>{{ item.source_url }}</td>
                         </tr>
                         {% endfor %}
                     </tbody>
