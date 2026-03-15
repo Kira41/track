@@ -265,7 +265,7 @@ function getServerValue(string $key, string $default = ''): string
 }
 
 $img = $_GET['img'] ?? '';
-$img = str_replace('\\', '/', $img);
+$img = str_replace('\\\\', '/', $img);
 $img = ltrim($img, '/');
 
 if ($img === '' || !preg_match('/^[A-Za-z0-9._-]+\.png$/i', $img)) {
