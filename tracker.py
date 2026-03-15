@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import io
-import os
-import re
-import zipfile
-from pathlib import Path
-from typing import List
 import hashlib
+import io
+import json
+import re
+import urllib.error
+import urllib.request
+import zipfile
+from typing import Dict, List, Set
 
 from flask import Flask, render_template_string, request, send_file
 from PIL import Image
@@ -19,13 +20,6 @@ def email_to_10_digits(email: str) -> str:
     digest = hashlib.sha256(normalized.encode("utf-8")).digest()
     num = int.from_bytes(digest[:8], "big") % 10_000_000_000
     return str(num).zfill(10)
-
-    if len(data) > 255:
-        raise ValueError("Email too long")
-
-    payload = bytes([len(data)]) + data
-    num = int.from_bytes(payload, "big")
-    return str(num)
 
 
 def parse_emails(raw: str) -> List[str]:
@@ -47,6 +41,95 @@ def parse_emails(raw: str) -> List[str]:
         results.append(normalized)
 
     return results
+
+
+def parse_urls(raw: str) -> List[str]:
+    candidates = [line.strip() for line in raw.replace(",", "\n").splitlines()]
+    seen: Set[str] = set()
+    urls: List[str] = []
+
+    for item in candidates:
+        if not item:
+            continue
+        if not item.lower().startswith(("http://", "https://")):
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        urls.append(item)
+
+    return urls
+
+
+def extract_identifier_from_text(value: str) -> str | None:
+    match = re.search(r"(\d{10})\.png", value)
+    if match:
+        return match.group(1)
+    return None
+
+
+def fetch_identifiers_from_jsonl(url: str) -> tuple[Set[str], str | None]:
+    identifiers: Set[str] = set()
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "TrackDashboard/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        return identifiers, f"{url}: {exc}"
+
+    for line in payload.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+
+        image_value = str(record.get("image", ""))
+        request_uri = str(record.get("request_uri", ""))
+
+        candidate = extract_identifier_from_text(image_value) or extract_identifier_from_text(request_uri)
+        if candidate:
+            identifiers.add(candidate)
+
+    return identifiers, None
+
+
+def analyze_stay_data(raw_emails: str, raw_urls: str) -> Dict[str, object]:
+    emails = parse_emails(raw_emails)
+    urls = parse_urls(raw_urls)
+
+    email_map = {email_to_10_digits(email): email for email in emails}
+    all_found_ids: Set[str] = set()
+    url_errors: List[str] = []
+
+    for url in urls:
+        found_ids, error = fetch_identifiers_from_jsonl(url)
+        all_found_ids.update(found_ids)
+        if error:
+            url_errors.append(error)
+
+    matched_ids = sorted(identifier for identifier in all_found_ids if identifier in email_map)
+    unmatched_ids = sorted(identifier for identifier in all_found_ids if identifier not in email_map)
+
+    matches = [
+        {"identifier": identifier, "email": email_map[identifier]}
+        for identifier in matched_ids
+    ]
+
+    return {
+        "emails": emails,
+        "urls": urls,
+        "matches": matches,
+        "matched_count": len(matches),
+        "found_count": len(all_found_ids),
+        "email_count": len(emails),
+        "url_count": len(urls),
+        "unmatched_ids": unmatched_ids,
+        "errors": url_errors,
+    }
 
 
 def build_php_file() -> str:
@@ -163,6 +246,8 @@ HTML_TEMPLATE = """
             color: #58a6ff;
         }
         .nav-item {
+            display: block;
+            text-decoration: none;
             padding: 12px 14px;
             margin-bottom: 10px;
             border-radius: 12px;
@@ -197,7 +282,7 @@ HTML_TEMPLATE = """
         }
         textarea {
             width: 100%;
-            min-height: 320px;
+            min-height: 220px;
             resize: vertical;
             border-radius: 14px;
             border: 1px solid #30363d;
@@ -256,18 +341,35 @@ HTML_TEMPLATE = """
             padding: 12px 14px;
             border-radius: 12px;
         }
+        .table {
+            width: 100%;
+            margin-top: 16px;
+            border-collapse: collapse;
+        }
+        .table th,
+        .table td {
+            text-align: left;
+            border-bottom: 1px solid #30363d;
+            padding: 10px 8px;
+            font-size: 14px;
+        }
+        .muted {
+            color: #8b949e;
+            font-size: 13px;
+        }
     </style>
 </head>
 <body>
     <div class="layout">
         <aside class="sidebar">
             <div class="brand">Black Dashboard</div>
-            <div class="nav-item active">Email to PNG Packager</div>
-            <div class="nav-item">ZIP Export</div>
+            <a href="/" class="nav-item {{ 'active' if active_page == 'packager' else '' }}">Email to PNG Packager</a>
+            <a href="/stay" class="nav-item {{ 'active' if active_page == 'stay' else '' }}">Stay</a>
             <div class="nav-item">PHP Bundle</div>
         </aside>
 
         <main class="content">
+            {% if active_page == 'packager' %}
             <div class="card">
                 <h1>Email Image Packager</h1>
                 <p>Paste one email per line, or comma-separated. The app generates a ZIP containing <code>track.php</code>, <code>.htaccess</code>, and an <code>image/</code> folder with blank white PNG files named by the numeric email identifier.</p>
@@ -294,6 +396,76 @@ HTML_TEMPLATE = """
                     <div class="error">{{ error }}</div>
                 {% endif %}
             </div>
+            {% else %}
+            <div class="card">
+                <h1>Stay Dashboard</h1>
+                <p>ضع الإيميلات في الحقل الأول، وروابط JSONL في الحقل الثاني (رابط بكل سطر). سيتم تحويل الإيميلات إلى معرف 10 أرقام ثم مقارنة أي ملف <code>.png</code> يظهر في اللوجات مع هذه المعرفات.</p>
+
+                <form method="post" action="/stay">
+                    <label class="muted">Emails</label>
+                    <textarea name="emails" placeholder="john@example.com\nalice@example.com">{{ stay_emails|default('') }}</textarea>
+
+                    <label class="muted" style="display:block; margin-top:14px;">URLs (JSONL)</label>
+                    <textarea name="urls" placeholder="https://site.com/image_log.jsonl">{{ stay_urls|default('') }}</textarea>
+
+                    <div class="row">
+                        <button type="submit" class="btn btn-primary">Analyze Stay Logs</button>
+                    </div>
+                </form>
+
+                <div class="row">
+                    <div class="stat">
+                        <div class="stat-label">Emails</div>
+                        <div class="stat-value">{{ stay_email_count }}</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label">URLs</div>
+                        <div class="stat-value">{{ stay_url_count }}</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label">Found IDs</div>
+                        <div class="stat-value">{{ stay_found_count }}</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label">Matched</div>
+                        <div class="stat-value">{{ stay_matched_count }}</div>
+                    </div>
+                </div>
+
+                {% if stay_errors %}
+                    <div class="error">
+                        {% for err in stay_errors %}
+                            <div>{{ err }}</div>
+                        {% endfor %}
+                    </div>
+                {% endif %}
+
+                {% if stay_matches %}
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Identifier</th>
+                            <th>Email</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in stay_matches %}
+                        <tr>
+                            <td>{{ item.identifier }}.png</td>
+                            <td>{{ item.email }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% elif stay_checked %}
+                    <p class="muted">No matching identifiers were found.</p>
+                {% endif %}
+
+                {% if stay_unmatched_ids %}
+                    <p class="muted">Unmatched IDs in logs: {{ stay_unmatched_ids|join(', ') }}</p>
+                {% endif %}
+            </div>
+            {% endif %}
         </main>
     </div>
 </body>
@@ -305,6 +477,7 @@ HTML_TEMPLATE = """
 def index():
     return render_template_string(
         HTML_TEMPLATE,
+        active_page="packager",
         emails="",
         valid_count=0,
         unique_count=0,
@@ -320,6 +493,7 @@ def generate():
     if not emails:
         return render_template_string(
             HTML_TEMPLATE,
+            active_page="packager",
             emails=raw_emails,
             valid_count=0,
             unique_count=0,
@@ -332,6 +506,44 @@ def generate():
         mimetype="application/zip",
         as_attachment=True,
         download_name="email_image_bundle.zip",
+    )
+
+
+@app.route("/stay", methods=["GET", "POST"])
+def stay_dashboard():
+    if request.method == "GET":
+        return render_template_string(
+            HTML_TEMPLATE,
+            active_page="stay",
+            stay_emails="",
+            stay_urls="",
+            stay_email_count=0,
+            stay_url_count=0,
+            stay_found_count=0,
+            stay_matched_count=0,
+            stay_matches=[],
+            stay_unmatched_ids=[],
+            stay_errors=[],
+            stay_checked=False,
+        )
+
+    raw_emails = request.form.get("emails", "")
+    raw_urls = request.form.get("urls", "")
+    analysis = analyze_stay_data(raw_emails, raw_urls)
+
+    return render_template_string(
+        HTML_TEMPLATE,
+        active_page="stay",
+        stay_emails=raw_emails,
+        stay_urls=raw_urls,
+        stay_email_count=analysis["email_count"],
+        stay_url_count=analysis["url_count"],
+        stay_found_count=analysis["found_count"],
+        stay_matched_count=analysis["matched_count"],
+        stay_matches=analysis["matches"],
+        stay_unmatched_ids=analysis["unmatched_ids"],
+        stay_errors=analysis["errors"],
+        stay_checked=True,
     )
 
 
