@@ -134,41 +134,93 @@ def analyze_stay_data(raw_emails: str, raw_urls: str) -> Dict[str, object]:
 
 def build_php_file() -> str:
     return """<?php
+declare(strict_types=1);
 
-function decryptEmailNumeric(string $number): string
+$baseDir = __DIR__ . '/image/';
+$logFile = __DIR__ . '/image_log.jsonl';
+
+function getClientIp(): string
 {
-    if (!preg_match('/^\\d+$/', $number)) {
-        throw new Exception("Invalid numeric input");
+    $keys = [
+        'HTTP_CF_CONNECTING_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_REAL_IP',
+        'REMOTE_ADDR',
+    ];
+
+    foreach ($keys as $key) {
+        if (!empty($_SERVER[$key])) {
+            $value = trim((string) $_SERVER[$key]);
+
+            if ($key === 'HTTP_X_FORWARDED_FOR') {
+                $parts = explode(',', $value);
+                $value = trim($parts[0]);
+            }
+
+            if (filter_var($value, FILTER_VALIDATE_IP)) {
+                return $value;
+            }
+        }
     }
 
-    if (bccomp($number, '0') === 0) {
-        throw new Exception("Invalid numeric payload");
-    }
-
-    $bytes = '';
-
-    while (bccomp($number, '0') > 0) {
-        $remainder = bcmod($number, '256');
-        $bytes = chr((int)$remainder) . $bytes;
-        $number = bcdiv($number, '256', '0');
-    }
-
-    if (strlen($bytes) < 1) {
-        throw new Exception("Corrupted numeric payload");
-    }
-
-    $emailLen = ord($bytes[0]);
-    $email = substr($bytes, 1, $emailLen);
-
-    if (strlen($email) !== $emailLen) {
-        throw new Exception("Corrupted numeric payload");
-    }
-
-    return $email;
+    return 'unknown';
 }
 
-header('Content-Type: text/plain; charset=utf-8');
-echo "track.php generated successfully.";
+function getServerValue(string $key, string $default = ''): string
+{
+    return isset($_SERVER[$key]) ? trim((string) $_SERVER[$key]) : $default;
+}
+
+$img = $_GET['img'] ?? '';
+$img = str_replace('\\', '/', $img);
+$img = ltrim($img, '/');
+
+if ($img === '' || !preg_match('/^[A-Za-z0-9._-]+\.png$/i', $img)) {
+    http_response_code(400);
+    exit('Invalid image name');
+}
+
+$imagePath = realpath($baseDir . $img);
+$baseReal  = realpath($baseDir);
+
+if ($imagePath === false || $baseReal === false || strpos($imagePath, $baseReal) !== 0 || !is_file($imagePath)) {
+    http_response_code(404);
+    exit('Image not found');
+}
+
+$ip        = getClientIp();
+$userAgent = getServerValue('HTTP_USER_AGENT', 'unknown');
+$referer   = getServerValue('HTTP_REFERER', 'direct');
+$method    = getServerValue('REQUEST_METHOD', 'GET');
+$requestUri = getServerValue('REQUEST_URI', '');
+$timeIso   = date('c');
+$timestamp = time();
+
+$record = [
+    'time_iso'    => $timeIso,
+    'timestamp'   => $timestamp,
+    'image'       => $img,
+    'ip'          => $ip,
+    'user_agent'  => $userAgent,
+    'referer'     => $referer,
+    'method'      => $method,
+    'request_uri' => $requestUri,
+];
+
+file_put_contents(
+    $logFile,
+    json_encode($record, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . PHP_EOL,
+    FILE_APPEND | LOCK_EX
+);
+
+header('Content-Type: image/png');
+header('Content-Length: ' . (string) filesize($imagePath));
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: 0');
+
+readfile($imagePath);
+exit;
 """
 
 
