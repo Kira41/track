@@ -119,8 +119,11 @@ def analyze_stay_data(raw_emails: str, raw_urls: str) -> Dict[str, object]:
         for identifier in matched_ids
     ]
 
+    mapped_ids = sorted(email_map.keys())
+
     return {
         "emails": emails,
+        "mapped_ids": mapped_ids,
         "urls": urls,
         "matches": matches,
         "matched_count": len(matches),
@@ -415,15 +418,14 @@ HTML_TEMPLATE = """
     <div class="layout">
         <aside class="sidebar">
             <div class="brand">Black Dashboard</div>
-            <a href="/" class="nav-item {{ 'active' if active_page == 'packager' else '' }}">Email to PNG Packager</a>
+            <a href="/" class="nav-item {{ 'active' if active_page == 'packager' else '' }}">Email to PNG Package</a>
             <a href="/stay" class="nav-item {{ 'active' if active_page == 'stay' else '' }}">Stay</a>
-            <div class="nav-item">PHP Bundle</div>
         </aside>
 
         <main class="content">
             {% if active_page == 'packager' %}
             <div class="card">
-                <h1>Email Image Packager</h1>
+                <h1>Email to PNG Package</h1>
                 <p>Paste one email per line, or comma-separated. The app generates a ZIP containing <code>track.php</code>, <code>.htaccess</code>, and an <code>image/</code> folder with blank white PNG files named by the numeric email identifier.</p>
 
                 <form method="post" action="/generate">
@@ -513,6 +515,10 @@ HTML_TEMPLATE = """
                     <p class="muted">No matching identifiers were found.</p>
                 {% endif %}
 
+                {% if stay_mapped_ids %}
+                    <p class="muted">Email IDs (10 digits): {{ stay_mapped_ids|join(', ') }}</p>
+                {% endif %}
+
                 {% if stay_unmatched_ids %}
                     <p class="muted">Unmatched IDs in logs: {{ stay_unmatched_ids|join(', ') }}</p>
                 {% endif %}
@@ -573,6 +579,7 @@ def stay_dashboard():
             stay_url_count=0,
             stay_found_count=0,
             stay_matched_count=0,
+            stay_mapped_ids=[],
             stay_matches=[],
             stay_unmatched_ids=[],
             stay_errors=[],
@@ -592,6 +599,7 @@ def stay_dashboard():
         stay_url_count=analysis["url_count"],
         stay_found_count=analysis["found_count"],
         stay_matched_count=analysis["matched_count"],
+        stay_mapped_ids=analysis["mapped_ids"],
         stay_matches=analysis["matches"],
         stay_unmatched_ids=analysis["unmatched_ids"],
         stay_errors=analysis["errors"],
