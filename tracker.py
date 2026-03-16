@@ -474,7 +474,7 @@ HTML_TEMPLATE = """
         .nav-item.active { background: #203050; border-color: #4f78d0; }
         .content { flex: 1; padding: 28px; }
         .card {
-            max-width: 1180px;
+            width: 100%;
             background: rgba(14,20,32,0.95);
             border: 1px solid #2d3d5d;
             border-radius: 18px;
