@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -17,6 +19,10 @@ from PIL import Image
 
 app = Flask(__name__)
 DB_PATH = Path(__file__).with_name("tracker.db")
+IPDETECTIVE_API_URL = "https://api.ipdetective.io/ip"
+DEFAULT_IPDETECTIVE_API_KEY = "050ee9d4-f74e-4eb6-b266-f8fec46855da"
+IPDETECTIVE_API_KEY = os.getenv("IPDETECTIVE_API_KEY", DEFAULT_IPDETECTIVE_API_KEY)
+BOT_IP_CACHE: Dict[str, bool] = {}
 
 
 def init_db() -> None:
@@ -159,6 +165,35 @@ def fetch_records_from_jsonl(url: str) -> Tuple[List[Dict[str, object]], str | N
     return records, None
 
 
+def is_bot_ip(ip_value: str) -> bool:
+    ip = ip_value.strip()
+    if not ip or ip.lower() == "unknown":
+        return False
+
+    if ip in BOT_IP_CACHE:
+        return BOT_IP_CACHE[ip]
+
+    req = urllib.request.Request(
+        f"{IPDETECTIVE_API_URL}?ip={urllib.parse.quote(ip)}",
+        headers={
+            "User-Agent": "TrackDashboard/2.0",
+            "x-api-key": IPDETECTIVE_API_KEY,
+        },
+    )
+
+    is_bot = False
+    try:
+        with urllib.request.urlopen(req, timeout=6) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+            parsed = json.loads(payload)
+            is_bot = bool(parsed.get("bot", False))
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        is_bot = False
+
+    BOT_IP_CACHE[ip] = is_bot
+    return is_bot
+
+
 def analyze_stay_data(raw_urls: str, known_event_keys: Set[str] | None = None) -> Dict[str, object]:
     urls = parse_urls(raw_urls)
     mapping_rows = get_all_email_mappings()
@@ -187,9 +222,10 @@ def analyze_stay_data(raw_urls: str, known_event_keys: Set[str] | None = None) -
             all_rows.append(enriched)
 
             if identifier in email_map:
-                matched_rows.append(enriched)
-                if str(record.get("event_key", "")) not in known_event_keys:
-                    new_matched_rows.append(enriched)
+                if not is_bot_ip(str(record.get("ip", ""))):
+                    matched_rows.append(enriched)
+                    if str(record.get("event_key", "")) not in known_event_keys:
+                        new_matched_rows.append(enriched)
 
         if error:
             url_errors.append(error)
