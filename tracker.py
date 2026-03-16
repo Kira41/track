@@ -23,6 +23,7 @@ IPDETECTIVE_API_URL = "https://api.ipdetective.io/ip"
 DEFAULT_IPDETECTIVE_API_KEY = "050ee9d4-f74e-4eb6-b266-f8fec46855da"
 IPDETECTIVE_API_KEY = os.getenv("IPDETECTIVE_API_KEY", DEFAULT_IPDETECTIVE_API_KEY)
 BOT_IP_CACHE: Dict[str, bool] = {}
+PAGE_SIZE = 50
 
 
 def init_db() -> None:
@@ -194,6 +195,37 @@ def is_bot_ip(ip_value: str) -> bool:
     return is_bot
 
 
+
+def extract_domain_from_record(record: Dict[str, object]) -> str:
+    for key in ("referer", "source_url", "request_uri"):
+        value = str(record.get(key, "")).strip()
+        if not value:
+            continue
+        if value.lower() == "direct":
+            continue
+        parsed = urllib.parse.urlparse(value if "://" in value else f"https://{value}")
+        host = (parsed.netloc or parsed.path).strip().lower()
+        if host:
+            return host.split(":")[0]
+    return "unknown"
+
+
+def paginate_items(items: List[Dict[str, object]], page: int, page_size: int = PAGE_SIZE) -> Dict[str, object]:
+    safe_page = max(1, page)
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    if safe_page > total_pages:
+        safe_page = total_pages
+    start = (safe_page - 1) * page_size
+    end = start + page_size
+    return {
+        "items": items[start:end],
+        "page": safe_page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
 def analyze_stay_data(raw_urls: str, known_event_keys: Set[str] | None = None) -> Dict[str, object]:
     urls = parse_urls(raw_urls)
     mapping_rows = get_all_email_mappings()
@@ -244,11 +276,24 @@ def analyze_stay_data(raw_urls: str, known_event_keys: Set[str] | None = None) -
 
     unmatched_ids = sorted(identifier for identifier in all_found_ids if identifier not in email_map)
 
+    domain_counts: Dict[str, int] = {}
+    for item in matched_rows:
+        domain = extract_domain_from_record(item)
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+
+    sorted_domains = sorted(domain_counts.items(), key=lambda pair: pair[1], reverse=True)
+    domains = [{"domain": domain, "match_count": count} for domain, count in sorted_domains]
+
+    matches_page = paginate_items(matched_rows, page=1)
+    mappings_page = paginate_items(mapping_rows, page=1)
+    domains_page = paginate_items(domains, page=1)
+
     return {
         "urls": urls,
         "matches": matched_rows,
+        "matches_page": matches_page,
         "new_matches": new_matched_rows,
-        "all_rows": all_rows[:120],
+        "all_rows": all_rows,
         "matched_count": len(matched_rows),
         "new_matched_count": len(new_matched_rows),
         "found_count": len(all_found_ids),
@@ -256,7 +301,10 @@ def analyze_stay_data(raw_urls: str, known_event_keys: Set[str] | None = None) -
         "url_count": len(urls),
         "unmatched_ids": unmatched_ids,
         "errors": url_errors,
-        "stored_mappings": mapping_rows[:120],
+        "stored_mappings": mapping_rows,
+        "stored_mappings_page": mappings_page,
+        "domain_stats": domains,
+        "domain_stats_page": domains_page,
         "run_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
 
@@ -598,6 +646,23 @@ HTML_TEMPLATE = """
                     <div class="step-item">5) Displayed complete and newly discovered matches.</div>
                 </div>
 
+                <h3 style="margin-top:20px;">Matched Domains</h3>
+                <div class="table-wrap">
+                    <table class="table">
+                        <thead><tr><th>Rank</th><th>Domain</th><th>Total Matches</th></tr></thead>
+                        <tbody id="domain-body">
+                        {% for item in stay_domain_stats %}
+                        <tr><td>{{ loop.index }}</td><td>{% if loop.index == 1 %}🔥 {% endif %}{{ item.domain }}</td><td>{{ item.match_count }}</td></tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                <div class="row muted" style="margin-bottom:10px;">
+                    <button id="domain-prev" type="button" class="btn btn-muted">Prev Domains</button>
+                    <span id="domain-page-info">Page 1</span>
+                    <button id="domain-next" type="button" class="btn btn-muted">Next Domains</button>
+                </div>
+
                 <h3 style="margin-top:20px;">Matched Events</h3>
                 <div class="table-wrap">
                     <table class="table">
@@ -618,6 +683,11 @@ HTML_TEMPLATE = """
                         </tbody>
                     </table>
                 </div>
+                <div class="row muted" style="margin-bottom:10px;">
+                    <button id="match-prev" type="button" class="btn btn-muted">Prev Events</button>
+                    <span id="match-page-info">Page 1</span>
+                    <button id="match-next" type="button" class="btn btn-muted">Next Events</button>
+                </div>
 
                 <p class="muted" id="unmatched">{% if stay_unmatched_ids %}Unmatched IDs: {{ stay_unmatched_ids|join(', ') }}{% endif %}</p>
 
@@ -632,11 +702,20 @@ HTML_TEMPLATE = """
                         </tbody>
                     </table>
                 </div>
+                <div class="row muted" style="margin-bottom:10px;">
+                    <button id="mapping-prev" type="button" class="btn btn-muted">Prev Mappings</button>
+                    <span id="mapping-page-info">Page 1</span>
+                    <button id="mapping-next" type="button" class="btn btn-muted">Next Mappings</button>
+                </div>
             </div>
 
             <script>
                 const knownEventKeys = new Set();
                 let monitorActive = true;
+                const PAGE_SIZE = 50;
+                let matchesState = { items: [], page: 1 };
+                let mappingsState = { items: [], page: 1 };
+                let domainState = { items: [], page: 1 };
 
                 function escapeHtml(value) {
                     return String(value ?? '').replace(/[&<>"']/g, function(ch) {
@@ -653,6 +732,45 @@ HTML_TEMPLATE = """
                     </tr>`;
                 }
 
+                function pageSlice(items, page) {
+                    const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+                    const safePage = Math.min(Math.max(1, page), totalPages);
+                    const start = (safePage - 1) * PAGE_SIZE;
+                    return { rows: items.slice(start, start + PAGE_SIZE), page: safePage, totalPages };
+                }
+
+                function renderMatchesPage() {
+                    const body = document.getElementById('match-body');
+                    const paged = pageSlice(matchesState.items, matchesState.page);
+                    matchesState.page = paged.page;
+                    document.getElementById('match-page-info').textContent = `Page ${paged.page} / ${paged.totalPages}`;
+                    body.innerHTML = paged.rows.length ? paged.rows.map(rowHtml).join('') : '<tr><td colspan="11">No matched events yet.</td></tr>';
+                }
+
+                function renderMappingsPage() {
+                    const mappingBody = document.getElementById('mapping-body');
+                    const paged = pageSlice(mappingsState.items, mappingsState.page);
+                    mappingsState.page = paged.page;
+                    document.getElementById('mapping-page-info').textContent = `Page ${paged.page} / ${paged.totalPages}`;
+                    mappingBody.innerHTML = paged.rows.length
+                        ? paged.rows.map(item => `<tr><td>${escapeHtml(item.email)}</td><td>${escapeHtml(item.identifier)}</td><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(item.last_generated_at)}</td></tr>`).join('')
+                        : '<tr><td colspan="4">No saved mappings yet. Generate a package first.</td></tr>';
+                }
+
+                function renderDomainPage() {
+                    const domainBody = document.getElementById('domain-body');
+                    const paged = pageSlice(domainState.items, domainState.page);
+                    domainState.page = paged.page;
+                    document.getElementById('domain-page-info').textContent = `Page ${paged.page} / ${paged.totalPages}`;
+                    domainBody.innerHTML = paged.rows.length
+                        ? paged.rows.map((item, idx) => {
+                            const rank = ((paged.page - 1) * PAGE_SIZE) + idx + 1;
+                            const domainLabel = rank === 1 ? `🔥 ${escapeHtml(item.domain)}` : escapeHtml(item.domain);
+                            return `<tr><td>${rank}</td><td>${domainLabel}</td><td>${escapeHtml(item.match_count)}</td></tr>`;
+                        }).join('')
+                        : '<tr><td colspan="3">No matched domains yet.</td></tr>';
+                }
+
                 function renderAnalysis(data) {
                     document.getElementById('stored-count').textContent = data.stored_email_count;
                     document.getElementById('url-count').textContent = data.url_count;
@@ -664,13 +782,12 @@ HTML_TEMPLATE = """
                         ? `Unmatched IDs: ${data.unmatched_ids.join(', ')}`
                         : 'All discovered IDs are mapped in the database.';
 
-                    const body = document.getElementById('match-body');
-                    body.innerHTML = data.matches.length ? data.matches.map(rowHtml).join('') : '<tr><td colspan="11">No matched events yet.</td></tr>';
-
-                    const mappingBody = document.getElementById('mapping-body');
-                    mappingBody.innerHTML = data.stored_mappings.length
-                        ? data.stored_mappings.map(item => `<tr><td>${escapeHtml(item.email)}</td><td>${escapeHtml(item.identifier)}</td><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(item.last_generated_at)}</td></tr>`).join('')
-                        : '<tr><td colspan="4">No saved mappings yet. Generate a package first.</td></tr>';
+                    matchesState = { items: data.matches || [], page: 1 };
+                    mappingsState = { items: data.stored_mappings || [], page: 1 };
+                    domainState = { items: data.domain_stats || [], page: 1 };
+                    renderMatchesPage();
+                    renderMappingsPage();
+                    renderDomainPage();
 
                     data.matches.forEach(item => {
                         if (item.event_key) {
@@ -712,6 +829,38 @@ HTML_TEMPLATE = """
                     monitorActive = !monitorActive;
                     document.getElementById('monitor-status').textContent = monitorActive ? 'Active' : 'Paused';
                     this.textContent = monitorActive ? 'Pause Auto Monitor' : 'Resume Auto Monitor';
+                });
+
+
+
+                document.getElementById('match-prev').addEventListener('click', function() {
+                    matchesState.page -= 1;
+                    renderMatchesPage();
+                });
+
+                document.getElementById('match-next').addEventListener('click', function() {
+                    matchesState.page += 1;
+                    renderMatchesPage();
+                });
+
+                document.getElementById('mapping-prev').addEventListener('click', function() {
+                    mappingsState.page -= 1;
+                    renderMappingsPage();
+                });
+
+                document.getElementById('mapping-next').addEventListener('click', function() {
+                    mappingsState.page += 1;
+                    renderMappingsPage();
+                });
+
+                document.getElementById('domain-prev').addEventListener('click', function() {
+                    domainState.page -= 1;
+                    renderDomainPage();
+                });
+
+                document.getElementById('domain-next').addEventListener('click', function() {
+                    domainState.page += 1;
+                    renderDomainPage();
                 });
 
                 setInterval(async () => {
@@ -782,7 +931,8 @@ def stay_dashboard():
             stay_matches=[],
             stay_unmatched_ids=[],
             stay_errors=[],
-            stay_mappings=get_all_email_mappings()[:120],
+            stay_mappings=get_all_email_mappings()[:PAGE_SIZE],
+            stay_domain_stats=[],
             stay_run_at="-",
         )
 
@@ -797,10 +947,11 @@ def stay_dashboard():
         stay_url_count=analysis["url_count"],
         stay_found_count=analysis["found_count"],
         stay_matched_count=analysis["matched_count"],
-        stay_matches=analysis["matches"],
+        stay_matches=analysis["matches_page"]["items"],
         stay_unmatched_ids=analysis["unmatched_ids"],
         stay_errors=analysis["errors"],
-        stay_mappings=analysis["stored_mappings"],
+        stay_mappings=analysis["stored_mappings_page"]["items"],
+        stay_domain_stats=analysis["domain_stats_page"]["items"],
         stay_run_at=analysis["run_at"],
     )
 
